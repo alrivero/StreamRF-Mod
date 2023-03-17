@@ -4,6 +4,7 @@
 # Then, python opt.py <path_to>/nerf_synthetic/<scene> -t ckpt/<some_name>
 # or use launching script:   sh launch.sh <EXP_NAME> <GPU> <DATA_DIR>
 import torch
+import debug
 import torch.cuda
 import torch.optim
 import torch.nn.functional as F
@@ -29,7 +30,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from typing import NamedTuple, Optional, Union
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
@@ -246,12 +246,16 @@ group.add_argument('--nosphereinit', action='store_true', default=False,
 
 group.add_argument('--offset', type=int, default=250)
 
+group.add_argument('--gpu_id', type=int, default=-1, help='ID of desired GPU')
+
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
 
 assert args.lr_sigma_final <= args.lr_sigma, "lr_sigma must be >= lr_sigma_final"
 assert args.lr_sh_final <= args.lr_sh, "lr_sh must be >= lr_sh_final"
 assert args.lr_basis_final <= args.lr_basis, "lr_basis must be >= lr_basis_final"
+
+device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
 
 os.makedirs(args.train_dir, exist_ok=True)
 summary_writer = SummaryWriter(args.train_dir)
@@ -276,6 +280,17 @@ dset = datasets[args.dataset_type](
                n_images=args.n_train,
                offset=args.offset,
                **config_util.build_data_options(args))
+
+def deploy_dset(dset):
+    dset.c2w = torch.from_numpy(dset.c2w)
+    dset.gt = torch.from_numpy(dset.gt).float()
+
+    if not dset.is_train_split:
+        dset.render_c2w = torch.from_numpy(dset.render_c2w)
+    else:
+        dset.gen_rays()  
+    return dset
+dset = deploy_dset(dset)
 
 if args.background_nlayers > 0 and not dset.should_use_background:
     warn('Using a background model for dataset type ' + str(type(dset)) + ' which typically does not use background')
@@ -397,7 +412,7 @@ while True:
 
             n_images_gen = 0
             for i, img_id in tqdm(enumerate(img_ids), total=len(img_ids)):
-                c2w = dset_test.c2w[img_id].to(device=device)
+                c2w = torch.tensor(dset_test.c2w[img_id]).to(device=device)
                 cam = svox2.Camera(c2w,
                                    dset_test.intrins.get('fx', img_id),
                                    dset_test.intrins.get('fy', img_id),
@@ -407,7 +422,7 @@ while True:
                                    height=dset_test.get_image_size(img_id)[0],
                                    ndc_coeffs=dset_test.ndc_coeffs)
                 rgb_pred_test = grid.volume_render_image(cam, use_kernel=True)
-                rgb_gt_test = dset_test.gt[img_id].to(device=device)
+                rgb_gt_test = torch.tensor(dset_test.gt[img_id]).to(device=device)
                 all_mses = ((rgb_gt_test - rgb_pred_test) ** 2).cpu()
                 if i % img_save_interval == 0:
                     img_pred = rgb_pred_test.cpu()

@@ -38,13 +38,13 @@ from typing import NamedTuple, Optional, Union
 from loguru import logger
 from multiprocess import Pool
 
+import debug
 
 # runtime_svox2file = os.path.join(os.path.dirname(svox2.__file__), 'svox2.py')
 # update_svox2file = '../svox2/svox2.py'
 # if md5(open(runtime_svox2file,'rb').read()).hexdigest() != md5(open(update_svox2file,'rb').read()).hexdigest():
 #     raise Exception("Not INSTALL the NEWEST svox2.py")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
@@ -197,8 +197,12 @@ group.add_argument('--apply_narrow_band',  action="store_true", default=False,he
 group.add_argument('--render_all',  action="store_true", default=False,help="render all camera in sequence")
 group.add_argument('--save_delta',  action="store_true", default=False,help="save delta in compress saving")
 
+group.add_argument('--gpu_id', type=int, default=-1, help='ID of desired GPU')
+
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
+
+device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
 
 DEBUG = args.debug
 assert args.lr_sigma_final <= args.lr_sigma, "lr_sigma must be >= lr_sigma_final"
@@ -233,7 +237,7 @@ print("Load pretrained model Done!")
 from copy import deepcopy
 from torch import nn
 
-
+import pickle
 
 
 def grid_copy( old_grid: svox2.SparseGrid, device: Union[torch.device, str] = "cpu"):
@@ -311,6 +315,7 @@ def compress_saving(grid_pre, grid_next, grid_holder, save_delta=False,saving_na
     mask_pre = grid_pre.links>=0
     mask_next = grid_next.links>=0
     new_cap = mask_next.sum()
+    logger.debug(f"mask size: {mask_next.shape}")
     
     diff_area = torch.logical_xor(mask_pre, mask_next)
 
@@ -451,13 +456,16 @@ dset_queue = Queue()
 def pre_fetch_dataset():
     while True:
         try:
+            logger.debug(f'Waiting for new frame... (Queue Size: {frame_idx_queue.qsize()})')
             frame_idx = frame_idx_queue.get(block=True,timeout=60)
+            logger.debug(f'Frame received. (Queue Size: {frame_idx_queue.qsize()})')
         except Empty:
-            logger.debug('ending data prefetch process')
+            logger.debug('Ending data prefetch process.')
             return 
         data_dir = os.path.join(args.data_dir, f'{frame_idx:04d}')
         train_dir = args.train_dir
         factor = 1
+        logger.debug(f'Loading frame: {frame_idx}')
         dset_train = datasets[args.dataset_type](
                     data_dir,
                     split="train",
@@ -469,7 +477,7 @@ def pre_fetch_dataset():
                     offset=args.offset,
                     verbose=False,
                     **config_util.build_data_options(args))
-        
+
         # dataset used to render test image, can include training camera for better visualization 
         dset_test = datasets[args.dataset_type](
                     data_dir, split= 'train' if args.render_all else "test", train_use_all=1 if args.render_all else 0,offset=args.offset, verbose=False, **config_util.build_data_options(args))
@@ -478,7 +486,7 @@ def pre_fetch_dataset():
         dset_eval = datasets[args.dataset_type](
                     data_dir, split="test", train_use_all=0,offset=args.offset, verbose=False, **config_util.build_data_options(args))
 
-        logger.debug(f"finish loading frame:{frame_idx}")
+        logger.debug(f"Finished loading frame: {frame_idx}")
         dset_queue.put((dset_train,dset_test, dset_eval))
     return dset_train, dset_test, dset_eval
 
@@ -506,14 +514,12 @@ def pre_fetch_dataset_standalone(frame_idx):
     dset_eval = datasets[args.dataset_type](
                 data_dir, split="test", train_use_all=0,offset=args.offset, verbose=False, **config_util.build_data_options(args))
 
-    logger.debug(f"finish loading frame:{frame_idx}")
+    logger.debug(f"Finished loading frame: {frame_idx}")
     return dset_train, dset_test, dset_eval
 
 
 
 def deploy_dset(dset):
-    dset.c2w = torch.from_numpy(dset.c2w)
-    dset.gt = torch.from_numpy(dset.gt).float()
     if not dset.is_train_split:
         dset.render_c2w = torch.from_numpy(dset.render_c2w)
     else:
@@ -545,7 +551,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
         grad_mask = narrow_band[grid.links>=0]
         grad_mask = grad_mask.view(-1)
     else:
-        grad_mask = (torch.ones([1]).float().cuda() == 1)
+        grad_mask = (torch.ones([1]).float().to(device=device)== 1)
    
 
     train_dir = args.train_dir
@@ -698,7 +704,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
                 img_ids = range(0, dset_eval.n_images, img_eval_interval)
                 n_images_gen = 0
                 for i, img_id in tqdm(enumerate(img_ids), total=len(img_ids)):
-                    c2w = dset_eval.c2w[img_id].to(device=device)
+                    c2w = torch.tensor(dset_eval.c2w[img_id]).to(device=device)
                     cam = svox2.Camera(c2w,
                                     dset_eval.intrins.get('fx', img_id),
                                     dset_eval.intrins.get('fy', img_id),
@@ -708,7 +714,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
                                     height=dset_eval.get_image_size(img_id)[0],
                                     ndc_coeffs=dset_eval.ndc_coeffs)
                     rgb_pred_test = grid.volume_render_image(cam, use_kernel=True)
-                    rgb_gt_test = dset_eval.gt[img_id].to(device=device)
+                    rgb_gt_test = torch.tensor(dset_eval.gt[img_id]).to(device=device)
                     all_mses = ((rgb_gt_test - rgb_pred_test) ** 2).cpu()
                     if i % img_save_interval == 0:
                         img_pred = rgb_pred_test.cpu()
@@ -796,7 +802,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
         compress_saving(grid_pre=grid_pre, grid_next=grid, grid_holder=grid, save_delta=args.save_delta,saving_name=f'{frame_idx:04d}')
     
     def render_img():
-        c2ws = dset_test.c2w.to(device=device)
+        c2ws = torch.tensor(dset_test.c2w).to(device=device)
         
         n_images = dset_test.n_images
         img_eval_interval = 1
@@ -836,7 +842,6 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
     with torch.no_grad():
         return render_img(), psnr
 
-
 dsets = pre_fetch_dataset_standalone(0)
 finetune_one_frame(0, 0, dsets)
 grid.save(os.path.join(args.train_dir, 'ckpt_pilot_0.npz'))
@@ -856,7 +861,6 @@ for i in range(prefetch_factor):
 
 for frame_idx in range(args.frame_start, args.frame_end) :
     # dset = dset_iter[frame_idx - args.frame_start]
-   
     dset = dset_queue.get(block=True)
 
     if frame_idx + prefetch_factor < args.frame_end:
@@ -873,7 +877,11 @@ for frame_idx in range(args.frame_start, args.frame_end) :
     train_frame_num += 1
 
 logger.critical(f'average psnr {sum(psnr_list)/len(psnr_list):.4f}')
+for i in range(len(psnr_list)):
+    logger.critical(f'Frame {i} psnr: {psnr_list[i]}')
 
+with open(os.path.join(args.train_dir, 'grid_delta_pilot', 'psnr_data.pkl'), "wb") as fp:
+    pickle.dump(psnr_list, fp)
 
 
 if train_frame_num:

@@ -104,10 +104,9 @@ class LLFFDataset(DatasetBase):
 
         self.ndc_coeffs = (2 * self.intrins_full.fx / self.w_full,
                            2 * self.intrins_full.fy / self.h_full)
+
         # if self.split == "train":
         #     self.gen_rays(factor=factor)
-        # else:
-        #     # Rays are not needed for testing
         self.h, self.w = self.h_full, self.w_full
         self.intrins = self.intrins_full
         self.should_use_background = False  # Give warning
@@ -189,6 +188,10 @@ class LLFFDataset(DatasetBase):
         if self.verbose:
             print('scene_radius', self.scene_radius)
         self.use_sphere_bound = False
+
+        # print(self.device)
+        # self.c2w = torch.tensor(self.c2w).to(device=self.device)
+        # self.gt = torch.tensor(self.gt).float().to(device=self.device)
 
     def gen_rays(self, factor=1):
         super().gen_rays(factor)
@@ -380,7 +383,6 @@ class SfMData:
 
         # get all image of this dataset
         images_path = [os.path.join(scaled_img_dir, f) for f in sorted(keep_images(os.listdir(image_dir)), key=nsvf_sort_key)]
-        # import ipdb;ipdb.set_trace()
         # LLFF dataset has only single camera in dataset
         if len(intrinsic) == 3:
             H, W, f = intrinsic

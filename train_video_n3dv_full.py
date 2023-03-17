@@ -44,8 +44,6 @@ from multiprocess import Pool
 # if md5(open(runtime_svox2file,'rb').read()).hexdigest() != md5(open(update_svox2file,'rb').read()).hexdigest():
 #     raise Exception("Not INSTALL the NEWEST svox2.py")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
 
@@ -189,8 +187,13 @@ group.add_argument('--apply_narrow_band',  action="store_true", default=False,he
 group.add_argument('--render_all',  action="store_true", default=False,help="render all camera in sequence")
 group.add_argument('--save_delta',  action="store_true", default=False,help="save delta in compress saving")
 
+group.add_argument('--gpu_id', type=int, default=-1, help='ID of desired GPU')
+
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
+
+device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
+torch.cuda.set_device(args.gpu_id)
 
 DEBUG = args.debug
 assert args.lr_sigma_final <= args.lr_sigma, "lr_sigma must be >= lr_sigma_final"
@@ -227,8 +230,6 @@ from copy import deepcopy
 from torch import nn
 
 
-
-
 def grid_copy( old_grid: svox2.SparseGrid, device: Union[torch.device, str] = "cpu"):
     """
     Load from path
@@ -254,7 +255,7 @@ def grid_copy( old_grid: svox2.SparseGrid, device: Union[torch.device, str] = "c
         center=center,
         basis_dim=basis_dim,
         use_z_order=False,
-        device="cpu",
+        device=device,
         basis_type=old_grid.basis_type ,
         mlp_posenc_size=old_grid.mlp_posenc_size, 
         mlp_width=old_grid.mlp_width,
@@ -526,8 +527,6 @@ def pre_fetch_dataset_standalone(frame_idx):
 
 
 def deploy_dset(dset):
-    dset.c2w = torch.from_numpy(dset.c2w)
-    dset.gt = torch.from_numpy(dset.gt).float()
     if not dset.is_train_split:
         dset.render_c2w = torch.from_numpy(dset.render_c2w)
     else:
@@ -555,10 +554,9 @@ def delete_area(grid, delet_mask):
 
 
 def load_delta(grid_pre, delta_path):
-
     delta  = torch.load(delta_path)
 
-    mask_next = delta['mask_next'].to(device)
+    mask_next = delta['mask_next'].to(device) # Mask found from pilot model
     addition_density = delta['addition_density'].to(device)
     addition_sh = delta['addition_sh'].to(device)
     keep_density = delta['keep_density'].to(device)
@@ -567,6 +565,7 @@ def load_delta(grid_pre, delta_path):
 
     mask_pre = grid_pre.links>=0
     new_cap = mask_next.sum()
+    logger.debug(f"mask size: {mask_next.shape}, {delta_path}")
     
     diff_area = torch.logical_xor(mask_pre, mask_next)
   
@@ -621,7 +620,7 @@ def load_delta(grid_pre, delta_path):
     grid_pre.links = new_links.view(grid_pre.links.shape).to(device=device)
 
     change_mask = torch.zeros_like(mask_pre)
-    change_mask[torch.logical_and(mask_pre!=0, minus_area==0)] = part2_keep_area
+    change_mask[torch.logical_and(mask_pre!=0, minus_area==0)] = part2_keep_area # Everything that wasn't removed from the previous mask within the pilot
     change_mask[add_area] = True
 
 
@@ -640,9 +639,7 @@ def resample_mask(mask, shape):
 
 def finetune_one_frame(frame_idx, global_step_base, dsets):
     if args.compress_saving:
-        grid_pre = grid_copy(old_grid = grid, device=device)
-
-
+        grid_pre = grid_copy(old_grid = grid, device=device) 
 
     with torch.no_grad():
         
@@ -657,14 +654,12 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
             emask = ~emask
             narrow_band = torch.logical_xor(dmask, emask)
 
-
     
         delta_path = os.path.join(args.train_dir,'grid_delta_pilot',f'{frame_idx:04d}.pth')
         student_mask, minus_mask, mask_next, add_area = load_delta(grid_pilot, delta_path)
         
         H,W,D = student_mask.shape
         
-    
         mask_next = resample_mask(mask_next, grid.links.shape)
         student_mask = resample_mask(student_mask, grid.links.shape)
         add_mask = resample_mask(add_area, grid.links.shape)
@@ -860,7 +855,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
                 img_ids = range(0, dset_eval.n_images, img_eval_interval)
                 n_images_gen = 0
                 for i, img_id in tqdm(enumerate(img_ids), total=len(img_ids)):
-                    c2w = dset_eval.c2w[img_id].to(device=device)
+                    c2w = torch.tensor(dset_eval.c2w[img_id]).to(device=device)
                     cam = svox2.Camera(c2w,
                                     dset_eval.intrins.get('fx', img_id),
                                     dset_eval.intrins.get('fy', img_id),
@@ -870,7 +865,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
                                     height=dset_eval.get_image_size(img_id)[0],
                                     ndc_coeffs=dset_eval.ndc_coeffs)
                     rgb_pred_test = grid.volume_render_image(cam, use_kernel=True)
-                    rgb_gt_test = dset_eval.gt[img_id].to(device=device)
+                    rgb_gt_test = torch.tensor(dset_eval.gt[img_id]).to(device=device)
                     all_mses = ((rgb_gt_test - rgb_pred_test) ** 2).cpu()
                     if i % img_save_interval == 0:
                         img_pred = rgb_pred_test.cpu()
@@ -929,9 +924,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
             
             break
 
-
     if args.dilate_rate_after or args.dilate_rate_before:
-     
         sparsify_voxel_grid(grid, dilate=args.dilate_rate_after)
    
     @torch.no_grad()
@@ -958,7 +951,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
         compress_saving(grid_pre=grid_pre, grid_next=grid, grid_holder=grid, save_delta=args.save_delta,saving_name=f'{frame_idx:04d}')
     
     def render_img():
-        c2ws = dset_test.c2w.to(device=device)
+        c2ws = torch.tensor(dset_test.c2w).to(device=device)
         
         n_images = dset_test.n_images
         img_eval_interval = 1
@@ -1015,7 +1008,7 @@ for i in range(prefetch_factor):
 
 for frame_idx in range(args.frame_start, args.frame_end) :
    
-    dset = dset_queue.get(block=True)
+    dset = dset_queue.get(block=True, timeout=30)
 
     if frame_idx + prefetch_factor < args.frame_end:
         frame_idx_queue.put(frame_idx + prefetch_factor)

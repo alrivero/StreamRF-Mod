@@ -514,8 +514,6 @@ def pre_fetch_dataset_standalone(frame_idx):
 
 
 def deploy_dset(dset):
-    dset.c2w = torch.from_numpy(dset.c2w)
-    dset.gt = torch.from_numpy(dset.gt).float()
     if not dset.is_train_split:
         dset.render_c2w = torch.from_numpy(dset.render_c2w)
     else:
@@ -547,7 +545,7 @@ def finetune_one_frame(frame_idx, global_step_base, dsets):
         grad_mask = narrow_band[grid.links>=0]
         grad_mask = grad_mask.view(-1)
     else:
-        grad_mask = (torch.ones([1]).float().cuda() == 1)
+        grad_mask = (torch.ones([1]).float().to(device=device) == 1)
    
 
     train_dir = args.train_dir
@@ -850,7 +848,7 @@ for i in range(prefetch_factor):
 for frame_idx in range(args.frame_start, args.frame_end) :
     # dset = dset_iter[frame_idx - args.frame_start]
    
-    dset = dset_queue.get(block=True)
+    dset = dset_queue.get(block=True, timeout=30)
 
     if frame_idx + prefetch_factor < args.frame_end:
         frame_idx_queue.put(frame_idx + prefetch_factor)

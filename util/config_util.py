@@ -5,8 +5,6 @@ import json
 
 
 def define_common_args(parser : argparse.ArgumentParser):
-    parser.add_argument('data_dir', type=str)
-
     parser.add_argument('--config', '-c',
                          type=str,
                          default=None,
@@ -14,8 +12,7 @@ def define_common_args(parser : argparse.ArgumentParser):
 
     group = parser.add_argument_group("Data loading")
     group.add_argument('--dataset_type',
-                         choices=list(datasets.keys()) + ["auto"],
-                         default="auto",
+                         default="st-nerf",
                          help="Dataset type (specify type or use auto)")
     group.add_argument('--scene_scale',
                          type=float,

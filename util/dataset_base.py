@@ -52,6 +52,7 @@ class DatasetBase:
         dirs /= torch.norm(dirs, dim=-1, keepdim=True)
         dirs = dirs.reshape(1, -1, 3, 1)
         del xx, yy, zz
+        self.c2w = torch.tensor(self.c2w, device=dirs.device)
         dirs = (self.c2w[:, None, :3, :3] @ dirs)[..., 0]
 
         if factor != 1:
@@ -67,6 +68,7 @@ class DatasetBase:
             dirs = dirs.view(-1, 3)
             gt = gt.reshape(-1, 3)
 
+        gt = torch.tensor(gt, device=dirs.device).float()
         self.rays_init = Rays(origins=origins, dirs=dirs, gt=gt)
         self.rays = self.rays_init
 

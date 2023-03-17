@@ -35,8 +35,6 @@ import time
 # if md5(open(runtime_svox2file,'rb').read()).hexdigest() != md5(open(update_svox2file,'rb').read()).hexdigest():
 #     raise Exception("Not INSTALL the NEWEST svox2.py")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
 
@@ -174,10 +172,13 @@ group.add_argument('--keep_rms_data',  action="store_true", default=False,help="
 
 
 group.add_argument('--render_all',  action="store_true", default=False,help="render all camera in sequence")
+group.add_argument('--gpu_id', type=int, default=-1, help='ID of desired GPU')
 
 
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
+
+device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
 
 DEBUG = args.debug
 assert args.lr_sigma_final <= args.lr_sigma, "lr_sigma must be >= lr_sigma_final"

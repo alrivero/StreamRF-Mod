@@ -1,0 +1,9 @@
+[submodule "svox2"]
+	path = svox2
+	url = https://github.com/sxyu/svox2
+[submodule "point-radiance"]
+	path = point-radiance
+	url = https://github.com/sjtuzq/point-radiance
+[submodule "st-nerf"]
+	path = st-nerf
+	url = https://github.com/DarlingHang/st-nerf.git
