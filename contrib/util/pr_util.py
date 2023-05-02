@@ -6,7 +6,7 @@ from pytorch3d.ops import knn_points
 
 # Point cloud dialation based on 
 # https://www.sciencedirect.com/science/article/pii/S0924271620302264?via%3Dihub
-def dialate_pc(point_cloud, struct_elm, ref_point):
+def dialate_pc(point_cloud, struct_elm, ref_point, max_threshold=0.15):
     N, _ = point_cloud.shape
 
     # 1. Compute the distance point-to-point (dpp)
@@ -26,17 +26,23 @@ def dialate_pc(point_cloud, struct_elm, ref_point):
     all_struct_elm = all_struct_elm[needed_se]
 
     rand_perm = torch.randperm(all_struct_elm.size(0))
-    idx = rand_perm[:3000]
+    idx = rand_perm[:int(len(point_cloud) * max_threshold)]
     all_struct_elm = all_struct_elm[idx]
 
-    return all_struct_elm
+    origin_idx = (needed_se // struct_elm.shape[0])[idx]
+
+    return all_struct_elm, origin_idx
 
 # Used to visualize a point cloud as an interactive plot
-def visualize_pc(point_clouds, titles, out_path):
+def visualize_pc(point_clouds, titles, out_path, point_data):
     cloud_dfs = []
-    for cloud, title in zip(point_clouds, titles):
+    for cloud, title, data in zip(point_clouds, titles, point_data):
         cloud_df = pd.DataFrame(cloud, columns = ['x','y','z'])
-        cloud_df["Category"] = title
+        if point_data is None:
+            cloud_df["Category"] = title
+        else:
+            cloud_df["Category"] = point_data
+        
         cloud_dfs.append(cloud_df)
     cloud_dfs = pd.concat(cloud_dfs).reset_index(drop=True)
 

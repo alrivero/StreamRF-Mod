@@ -54,7 +54,6 @@ class Random_Transforms(object):
         self.is_center = is_center
         
     def __call__(self, img, Ks = None, Ts = None,  mask = None, label = None):
-
         K = Ks.clone()
         Tc = Ts.clone()
         img_np = np.asarray(img)
@@ -149,6 +148,7 @@ class Random_Transforms(object):
         K[0,2] = K[0,2] + translation[0]
         K[1,2] = K[1,2] + translation[1]
 
+        # import pdb; pdb.set_trace()
         s = self.size[0] * ration / height
 
         K = K*s

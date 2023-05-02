@@ -24,6 +24,7 @@ import argparse
 import pickle
 
 import numpy as np
+import torch.multiprocessing as mp
 
 from util.dataset import datasets
 from util.util import Timing, get_expon_lr_func, viridis_cmap
@@ -38,12 +39,13 @@ from tqdm import tqdm
 from typing import NamedTuple, Optional, Union
 from loguru import logger
 from multiprocess import Pool
+from PIL import Image
 
 import debug
 from point_radiance.modules.model import CoreModel as PointSHNeRF
 from point_radiance.dataloader.dataset import Data
 from util.args import config_args
-from torch.multiprocessing  import Queue, Process
+from torch.multiprocessing  import Process, Queue
 from queue import Empty
 
 from point_radiance.modules.utils import mse2psnr, \
@@ -71,7 +73,7 @@ def extra_args(parser):
     group.add_argument('--pretrained', type=str, default=None,
                     help='pretrained model')
 
-    group.add_argument('--frame_start', type=int, default=1, help='train frame among [frame_start, frame_end]')  
+    group.add_argument('--frame_start', type=int, default=0, help='train frame among [frame_start, frame_end]')  
     group.add_argument('--frame_end', type=int, default=30, help='train frame among [1, frame_end]')
     group.add_argument('--fps', type=int, default=30, help='video save fps')
 
@@ -102,21 +104,30 @@ def extra_args(parser):
 
     group.add_argument('--gpu_id', type=int, default=-1, help='ID of desired GPU')
     group.add_argument('--batch_size', type=int, default=1, help='# of views to train on')
-    group.add_argument('--init_epochs', type=int, default=-1, help='# of epochs to train base model with')
+    group.add_argument('--init_epochs_base', type=int, default=20, help='# of epochs to train base model with')
+    group.add_argument('--init_epochs_full', type=int, default=30, help='# of epochs to train base model with')
+    group.add_argument('--f2f_epochs', type=int, default=30, help='# of epochs to train model frame to frame with')
+    group.add_argument('--dpp_radius', type=float, default=1.75, help='Defines redius of dialation')
+    group.add_argument('--dialation_thresh', type=float, default=0.1, help='Defines threshold for max points of dialation')
+    group.add_argument("--double_steps", type=int, default=1, help='number of times to double pointcloud before refinement')
+    group.add_argument("--init_model", type=str, default=None, help='Base model to use in experiments')
+    group.add_argument("--save_init_model", action="store_true", default=False, help='Whether to save model being trained')
+    group.add_argument("--name", type=str, default="untitled", help='Name of our experiment')
+    
+    group.add_argument("--origin_vert_thresh", type=float, default=0.05, help='Pruning threshold for origin vertices movement')
+    group.add_argument("--origin_sh_thresh", type=float, default=0.025, help='Pruning threshold for origin vertices spherical harmonics')
+    group.add_argument("--origin_sh_thresh_zero", type=float, default=0.06, help='Pruning threshold for origin vertices spherical harmonics moving to zero')
+    group.add_argument("--dialated_vert_thresh", type=float, default=0.1, help='Pruning threshold for dialated vertices movement')
+    group.add_argument("--dialated_sh_thresh", type=float, default=0.22, help='Pruning threshold for dialated vertices spherical harmonics')
+
+    group.add_argument("--disable_origin_movement", action="store_true", default=False, help='Disables movement of origin points while training')
+    group.add_argument("--disable_origin_sh", action="store_true", default=False, help='Disables spherical harmonics of origin points while training')
 
     return parser
 
-args = config_args(extra_args)
-args = args.parse_args()
-device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
-
-summary_writer = SummaryWriter(args.train_dir)
-
-torch.manual_seed(20200823)
-np.random.seed(20200823)
 
 class Trainer():
-    def __init__(self, args, model):
+    def __init__(self, args, model, device):
         self.args = args
         self.model = model
         self.dataname = args.dataname
@@ -128,7 +139,7 @@ class Trainer():
         self.logfile = os.path.join(self.outpath, 'log_{}.txt'.format(self.dataname))
         self.logfile = open(self.logfile, 'w')
         self.loss_fn = torch.nn.MSELoss()
-        self.lr1, self.lr2, self.lr3  = args.lr1, args.lr2, args.lr3
+        self.lr1, self.lr2, self.lr3, self.lr4, self.lr5, self.lr6  = args.lr1, args.lr2, args.lr3, args.lr4, args.lr5, args.lr6
         self.lrexp, self.lr_s = args.lrexp, args.lr_s
         self.set_optimizer(self.lr1, self.lr2)
         self.imagesgt = torch.tensor(self.model.imagesgt).float().to(device)
@@ -139,7 +150,8 @@ class Trainer():
                         'v2_{:.3f}_{:.3f}'.format(args.data_r, args.splatting_r)))
         self.training_time = 0
 
-        self.init_epochs = args.init_epochs
+        self.init_epochs_base = args.init_epochs_base
+        self.init_epochs_full = args.init_epochs_full
         self.batch_size = args.batch_size
 
     def set_onlybase(self):
@@ -148,7 +160,11 @@ class Trainer():
     
     def remove_onlybase(self):
         self.model.onlybase = False
-        self.set_optimizer(self.lr3,self.lr2)
+        self.set_optimizer(self.lr3,self.lr4)
+
+    def set_f2f_train(self):
+        self.model.onlybase = False
+        self.set_optimizer(self.lr5,self.lr6)
 
     def set_optimizer(self, lr1=3e-3, lr2=8e-4):
         sh_list = [name for name, params in self.model.named_parameters() if 'sh' in name]
@@ -163,150 +179,217 @@ class Trainer():
         self.optimizer, self.lr_scheduler = optimizer, lr_scheduler
         return None
 
-    def test(self):
+    def test(self, visual=False):
         with torch.no_grad():
             loss_all, psnr_all = [], []
-            test_ids = self.i_split[2]
+            test_ids = np.array(self.i_split[2]).reshape(-1, 1)
             for id in test_ids:
                 images = self.model(id)
-                loss = self.loss_fn(images[0], self.imagesgt[id])
+                loss = self.loss_fn(images[0], self.imagesgt[id[0]])
                 loss_all.append(loss)
                 psnr_all.append(mse2psnr(loss))
                 if visual:
-                    pred = images[0, ..., :3].detach().cpu().data.numpy()
+                    pred = images[0].detach().cpu().data.numpy()
                     gt = self.imagesgt[id].detach().cpu().data.numpy()
-                    # set background as white for visualization
-                    mask = self.masks[id].cpu().data.numpy()
-                    pred = pred*mask+1-mask
-                    gt = gt*mask+1-mask
-                    img_gt = np.concatenate((pred,gt),1)
+                    img_gt = np.concatenate((pred,gt[0]),1)
                     img_gt = Image.fromarray((img_gt*255).astype(np.uint8))
-                    img_gt.save(os.path.join(self.imgout_path,
-                            'img_{}_{}_{:.2f}.png'.format(self.dataname, id, mse2psnr(loss).item())))
-            # loss_e = torch.stack(loss_all).mean().item()
-            # psnr_e = torch.stack(psnr_all).mean().item()
-            # info = '-----eval-----  loss:{:.3f} psnr:{:.3f}'.format(loss_e, psnr_e)
-            # print(info)
+                    img_gt.save(os.path.join("test",'img_{}_{}_{}.png'.format(self.args.name, id, self.model.frame_id)))
+                    
+            loss_e = torch.stack(loss_all).mean().item()
+            psnr_e = torch.stack(psnr_all).mean().item()
+            eval_message = '-----eval-----  loss:{:.3f} psnr:{:.3f}'.format(loss_e, psnr_e)
+            logger.critical(eval_message)
+
+            self.training_time += 1
             return psnr_e
 
-    def train(self):
+    def train(self, epoch_n=20):
         max_psnr = 0.
-        start_time = time.time()
         for epoch in range(epoch_n):
             loss_all, psnr_all = [], []
-            ids = self.i_split[0]
-            for id in tqdm(ids):
-                images = self.model(id)
-                loss = self.loss_fn(images[0], self.imagesgt_train[id])
-                loss = loss + self.lr_s * grad_loss(images[0], self.imagesgt_train[id])
+            np.random.shuffle(self.i_split[0])
+            ids = np.array(self.i_split[0]).reshape(-1, self.batch_size)
+            for id_batch in tqdm(ids):
+                images = self.model(id_batch)
+                loss = self.loss_fn(images, self.imagesgt_train[id_batch])
+                loss = loss + self.lr_s * grad_loss(images, self.imagesgt_train[id_batch])
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 loss_all.append(loss)
                 psnr_all.append(mse2psnr(loss))
             self.lr_scheduler.step()
-            # loss_e = torch.stack(loss_all).mean().item()
-            # psnr_e = torch.stack(psnr_all).mean().item()
-            # info = '-----train-----  epoch:{} loss:{:.3f} psnr:{:.3f}'.format(epoch, loss_e, psnr_e)
-            # print(info)
-            # self.logfile.write(info + '\n')
-            # self.logfile.flush()
-            psnr_val = self.test(self.i_split[1], False)
+            loss_e = torch.stack(loss_all).mean().item()
+            psnr_e = torch.stack(psnr_all).mean().item()
+            eval_message = '-----train-----  epoch:{} loss:{:.3f} psnr:{:.3f}'.format(epoch, loss_e, psnr_e)
+            logger.critical(eval_message)
+            psnr_val = self.test(False)
             if psnr_val > max_psnr:
                 max_psnr = psnr_val
         
-        torch.save(self.model.state_dict(), os.path.join(
-                 self.weightpath,'model_{}.pth'.format(self.dataname)))
+        # torch.save(self.model.state_dict(), os.path.join(
+        #          self.weightpath,'model_{}.pth'.format(self.dataname)))
+
 
     def solve_initial_frame(self):
         self.set_onlybase()
-        self.train(epoch_n=args.init_epochs)
+        logger.info("Training Initial Frame (Base Only)")
+        self.train(epoch_n=self.init_epochs_base)
         self.remove_onlybase()
-        self.train(epoch_n=args.init_epochs)
-        for i in range(args.refine_n):
+        logger.info("Training Initial Frame (SH Included)")
+        self.train(epoch_n=self.init_epochs_full)
+        logger.info("Point Cloud Refinement Phase Started")
+        for i in range(self.args.refine_n):
             trainer.model.remove_out()
-            trainer.model.repeat_pts()
-            trainer.train(epoch_n=args.init_epochs)
+            for i in range(self.args.double_steps):
+                trainer.model.repeat_pts()
+            trainer.set_optimizer(self.args.lr3, self.args.lr2)
+            trainer.train(epoch_n=self.init_epochs_full)
 
-def fetch_dataset(frame_idx):
-    args.frame_id = frame_idx
-    dataset = Data(args)
-    memitem = dataset.initpc()
+    def framedata_update(self, dset_memitem):
+        self.model.framedata_update(dset_memitem)
 
-    return memitem
+        self.imagesgt = torch.tensor(self.model.imagesgt).float().to(device)
+        self.masks = torch.tensor(self.model.masks).float().to(device)
+        self.i_split = self.model.i_split
+        self.imagesgt_train = self.imagesgt
 
-def pre_fetch_datasets(frame_idx):
-    while True:
-        try:
-            logger.debug(f'Waiting for new frame... (Queue Size: {frame_idx_queue.qsize()})')
-            frame_idx = frame_idx_queue.get(block=True,timeout=60)
-            logger.debug(f'Frame received. (Queue Size: {frame_idx_queue.qsize()})')
-        except Empty:
-            logger.debug('Ending data prefetch process.')
-            return 
+    def solve_frame(self):
+        prev_point_count = len(self.model.vertsparam)
+        self.model.apply_narrow_band()
+        inter_point_count = len(self.model.inactive_verts) + len(self.model.active_origin_verts)
+        logger.info(f"Frame {self.model.frame_id} Narrow Band: Previous Point Count = {prev_point_count}, Intermediate Point Count = {inter_point_count}")
+        logger.info(f"Point Breakdown: Inactive = {len(self.model.inactive_verts)}, Active Origin = {len(self.model.active_origin_verts)}")
         
-        logger.debug(f"Finished loading frame: {frame_idx}")
-        dset_queue.put(fetch_dataset(frame_idx))
+        self.set_f2f_train()
+        self.train(6)
 
-frame_idx_queue = Queue()
-dset_queue = Queue()
+        self.model.prune_and_record()
+        # self.model.remove_out()
+        new_point_count = len(self.model.inactive_verts) + len(self.model.active_origin_verts)
+        logger.info(f"Frame {self.model.frame_id} Pruning: Intermediate Point Count = {inter_point_count}, New Point Count = {new_point_count}")
+        logger.info(f"Point Breakdown: Inactive = {len(self.model.inactive_verts)}, Active Origin = {len(self.model.active_origin_verts)}")
 
+        self.train(10)
 
-if args.pretrained is not None:
-    print("LOAD MODEL")
-else:
-    base_memitem = fetch_dataset(args.frame_start)
-    base_model = PointSHNeRF(args, base_memitem)
-trainer = Trainer(args, base_model)
-print("HERE")
-trainer.solve_initial_frame()
+        self.model.finalize_verts_sh()
 
-pre_fetch_process = Process(target=pre_fetch_datasets)
-pre_fetch_process.start()
-prefetch_factor = 3
-for i in range(prefetch_factor):
-    frame_idx_queue.put(i + args.frame_start)
+class DataManager():
+    def __init__(self, args, frame_idx_queue, dset_queue):
+        self.args = args
+        self.frame_idx_queue = frame_idx_queue
+        self.dset_queue = dset_queue
+    
+    def pre_fetch_datasets(self):
+        while True:
+            try:
+                logger.info(f'Waiting for new frame... (Queue Size: {self.frame_idx_queue.qsize()})')
+                frame_idx = self.frame_idx_queue.get(block=True)
+                logger.info(f'Frame received. (Queue Size: {self.frame_idx_queue.qsize()})')
+            except Empty:
+                logger.info('Ending data prefetch process.')
+                return 
+            
+            logger.info(f"Finished loading frame: {frame_idx}")
+            self.args.frame_id = frame_idx
+            dataset = Data(self.args)
+            memitem = dataset.initpc()
+            self.dset_queue.put(memitem)
 
-train_frame_num = 0
-global_step_base = 0
-frames = []
-psnr_list = []
+if __name__ == '__main__':
+    mp.set_start_method('spawn')
+    mp.freeze_support()
 
-# for frame_idx in range(args.frame_start, args.frame_end) :
-#     # dset = dset_iter[frame_idx - args.frame_start]
-#     dset = dset_queue.get(block=True)
-
-#     if frame_idx + prefetch_factor < args.frame_end:
-#         frame_idx_queue.put(frame_idx + prefetch_factor)
-
-#     frame, psnr = finetune_one_frame(frame_idx, global_step_base, dset)
-#     frames.append(frame)
-#     psnr_list.append(psnr)
-#     if args.save_every_frame:
-#         os.makedirs(os.path.join(args.train_dir,"ckpts"))
-#         grid.save(os.path.join(args.train_dir,"ckpts",f'{frame_idx:04d}.npz'))
-
-#     global_step_base += args.n_iters
-#     train_frame_num += 1
-
-# logger.critical(f'average psnr {sum(psnr_list)/len(psnr_list):.4f}')
-# for i in range(len(psnr_list)):
-#     logger.critical(f'Frame {i} psnr: {psnr_list[i]}')
-
-# with open(os.path.join(args.train_dir, 'grid_delta_pilot', 'psnr_data.pkl'), "wb") as fp:
-#     pickle.dump(psnr_list, fp)
+    args = config_args(extra_args)
+    args = args.parse_args()
+    device = "cuda:" + str(args.gpu_id) if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu"
 
 
-# if train_frame_num:
-   
-#     tag = os.path.basename(args.train_dir) 
-#     vid_path = os.path.join(args.train_dir, tag+'_pilot.mp4')
-#     imageio.mimwrite(vid_path, frames, fps=args.fps, macro_block_size=8)
-#     logger.info('video write to', vid_path)
+    summary_writer = SummaryWriter(args.train_dir)
 
-#     grid.density_rms = torch.zeros([1])
-#     grid.sh_rms = torch.zeros([1])
-#     grid.save(os.path.join(args.train_dir, 'ckpt.npz'))
+    torch.manual_seed(20200823)
+    np.random.seed(20200823)
 
-# pre_fetch_process.join()
-# pre_fetch_process.close()
+    if args.init_model is not None:
+        base_model = torch.load(args.init_model).to(device=device)
+        base_model.dialation_thresh = args.dialation_thresh
+        base_model.origin_vert_thresh = args.origin_vert_thresh
+        base_model.origin_sh_thresh = args.origin_sh_thresh
+        base_model.origin_sh_thresh_zero = args.origin_sh_thresh_zero
+        base_model.disable_origin_movement = args.disable_origin_movement
+        base_model.disable_origin_sh = args.disable_origin_sh
+
+        base_model.viewdir = base_model.viewdir.to(device)
+        base_model.iter_tags = torch.full((len(base_model.vertsparam),), args.frame_start).to(device=device)
+
+        trainer = Trainer(args, base_model, device)
+    else:
+        args.frame_id = args.frame_start
+        dataset = Data(args)
+        base_memitem = dataset.initpc()
+        base_model = PointSHNeRF(args, base_memitem)
+        base_model = base_model.to(device=device)
+        base_model.f2f_training = False
+        trainer = Trainer(args, base_model, device)
+        trainer.solve_initial_frame()
+        if args.save_init_model:
+            torch.save(base_model, f"{args.name}_base_model.pt")
+
+    import pdb; pdb.set_trace()
+    base_model.f2f_training = False
+    logger.info(f"Frame {args.frame_start} Validation Accuracy")
+    trainer.test(True)
+    base_model.f2f_training = True
+
+    frame_idx_queue = Queue()
+    dset_queue = Queue()
+    data_manager = DataManager(args, frame_idx_queue, dset_queue)
+    pre_fetch_process = Process(target=data_manager.pre_fetch_datasets)
+    pre_fetch_process.start()
+    prefetch_factor = 3
+    for i in range(1, prefetch_factor):
+        frame_idx_queue.put(i + args.frame_start)
+
+    train_frame_num = 0
+    frames = []
+    psnr_list = []
+
+    for frame_idx in range(args.frame_start + 1, args.frame_end) :
+        dset_memitem = dset_queue.get(block=True)
+        if frame_idx + prefetch_factor < args.frame_end:
+            frame_idx_queue.put(frame_idx + prefetch_factor)
+
+        # trainer.framedata_update(dset_memitem)
+        # base_model.f2f_training = False
+        # trainer.remove_onlybase()
+        # logger.info("Training Initial Frame (SH Included)")
+        # trainer.train(epoch_n=25)
+
+        # Update our model to work with the new frame data
+        trainer.framedata_update(dset_memitem)
+        logger.info(f"Solving frame: {frame_idx}")
+        trainer.solve_frame()
+        trainer.model.f2f_training = False
+        test_psnr = trainer.test(True)
+        trainer.model.f2f_training = True
+
+        psnr_list.append(test_psnr)
+        train_frame_num += 1
+
+    logger.critical(f'average psnr {sum(psnr_list)/len(psnr_list):.4f}')
+    for i in range(len(psnr_list)):
+        logger.critical(f'Frame {i} psnr: {psnr_list[i]}')
+
+
+    # if train_frame_num:
+    #     tag = os.path.basename(args.train_dir) 
+    #     vid_path = os.path.join(args.train_dir, tag+'_pilot.mp4')
+    #     imageio.mimwrite(vid_path, frames, fps=args.fps, macro_block_size=8)
+    #     logger.info('video write to', vid_path)
+
+    #     grid.density_rms = torch.zeros([1])
+    #     grid.sh_rms = torch.zeros([1])
+    #     grid.save(os.path.join(args.train_dir, 'ckpt.npz'))
+
+    # pre_fetch_process.join()
+    # pre_fetch_process.close()
